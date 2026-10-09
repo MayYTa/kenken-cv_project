@@ -40,6 +40,7 @@ def solve(n, cages):
     solver = cp_model.CpSolver()
     status = solver.Solve(m)
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        print(f'Solved in {solver.WallTime()*1000:.6f}ms')
         return [[solver.Value(x[(r, c)]) for c in range(n)] for r in range(n)]
     if status == cp_model.INFEASIBLE:
         raise ValueError('The detected KenKen has no solution. Check the detected cages and glyphs.')
