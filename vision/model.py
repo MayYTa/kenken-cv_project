@@ -272,6 +272,39 @@ def parse_image(path: str | os.PathLike[str], model: Net) -> dict[str, Any]:
     return {"n": n, "filename": Path(path).name, "cages": cages}
 
 
+def parse_image_full(path: str | os.PathLike[str], model: Net) -> dict[str, Any]:
+    """Parse the image and return all intermediate data for visualization.
+    
+    Returns a dictionary containing:
+      - 'n': grid size
+      - 'filename': name of the image file
+      - 'cages': list of parsed cages
+      - 'warp': normalized board image (S x S)
+      - 'xs', 'ys': grid line coordinates
+    """
+    image = cv2.imread(str(path))
+    if image is None:
+        raise FileNotFoundError(f"Could not read image: {path}")
+    warp, ink = preprocess(image)
+    n, xs, ys = find_grid(warp)
+    vertical, horizontal = edge_scores(ink, n, xs, ys)
+    cages = []
+    for cells in cage_cells(n, vertical, horizontal):
+        r, c = min(map(tuple, cells))
+        clue = decode(classify(model, segment_label(ink, xs, ys, r, c)))
+        if clue is None:
+            raise ValueError(f"Could not recognize clue at {(r, c)} in {path}.")
+        cages.append({**clue, "cells": cells})
+    return {
+        "n": n,
+        "filename": Path(path).name,
+        "cages": cages,
+        "warp": warp,
+        "xs": xs,
+        "ys": ys
+    }
+
+
 def export_json(paths: list[str], model: Net, out: str | os.PathLike[str]) -> str:
     paths = [str(path) for path in paths]
     if not paths:
