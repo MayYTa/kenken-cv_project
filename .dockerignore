@@ -1,0 +1,9 @@
+.venv
+dataset
+dataset_test
+viz
+*.jpg
+*.jpeg
+*.png
+__pycache__
+.git

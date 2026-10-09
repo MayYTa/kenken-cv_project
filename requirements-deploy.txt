@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+streamlit
+requests
+numpy
+opencv-python-headless
+matplotlib
+pillow
+ortools
