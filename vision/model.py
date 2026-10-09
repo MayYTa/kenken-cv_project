@@ -8,11 +8,9 @@ Commands:
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import random
-from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +23,7 @@ import torch.nn.functional as F
 
 CLASSES = list("0123456789") + ["+", "-", "*", "/"]
 S = 2520
-WALL_T = 0.5
+WALL_T = 0.6
 DEFAULT_MODEL = Path(__file__).with_name("glyph_cnn.pt")
 DEFAULT_PREDICTION = Path(__file__).with_name("pred.json")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -85,8 +83,37 @@ def preprocess(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     warp = cv2.warpPerspective(
         gray, cv2.getPerspectiveTransform(source, destination), (S, S)
     )
-    _, ink = cv2.threshold(warp, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Camera captures can contain high-frequency screen/moire texture. Do not
+    # blur every image: detect that texture and denoise only the binarization
+    # input, preserving the unmodified warp for grid detection.
+    texture = float(np.std(warp.astype(np.float32) - cv2.GaussianBlur(
+        warp, (0, 0), 7
+    )))
+    if texture > 12.0:
+        # Median filtering removes camera/screen texture, but another 5x5
+        # blur can merge adjacent clue characters such as "84".
+        binarization_input = cv2.medianBlur(warp, 5)
+    else:
+        binarization_input = cv2.GaussianBlur(warp, (5, 5), 0)
+    ink = _otsu_mask(binarization_input)
     return warp, ink
+
+
+def _otsu_mask(image: np.ndarray) -> np.ndarray:
+    return cv2.threshold(
+        image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )[1]
+
+
+def _fallback_inks(warp: np.ndarray) -> list[np.ndarray]:
+    """Return conservative masks for clues lost by texture denoising."""
+    return [
+        _otsu_mask(source)
+        for source in (
+        warp,
+        cv2.GaussianBlur(warp, (3, 3), 0),
+        )
+    ]
 
 
 def _clusters(profile: np.ndarray, threshold: float) -> list[float]:
@@ -100,8 +127,6 @@ def _clusters(profile: np.ndarray, threshold: float) -> list[float]:
 
 
 def find_grid(warp: np.ndarray) -> tuple[int, np.ndarray, np.ndarray]:
-    # A fixed threshold treats the whole gray background of camera photos as
-    # ink, producing one giant profile instead of the individual grid lines.
     background_level = float(np.percentile(warp, 50))
     line_threshold = (
         235.0
@@ -121,8 +146,8 @@ def edge_scores(
     ink: np.ndarray, n: int, xs: np.ndarray, ys: np.ndarray, hw: int | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
     if hw is None:
-        hw = max(5, round(4 * S / 600))
-    min_ink = max(3, round(2 * S / 600))
+        hw = max(5, round(5 * S / 600))
+    min_ink = max(3, round(3 * S / 600))
     vertical = np.zeros((n, n - 1))
     horizontal = np.zeros((n - 1, n))
     for r in range(n):
@@ -206,15 +231,25 @@ def segment_label(ink: np.ndarray, xs: np.ndarray, ys: np.ndarray, r: int, c: in
             continue
         components.append((x, x + width, i))
     components.sort()
+    heights = [stats[i][3] for _, _, i in components]
+    typical_height = float(np.median(heights)) if heights else 0
+    components = [
+        (xa, xb, i) for xa, xb, i in components
+        if stats[i][3] >= 0.35 * typical_height
+        or stats[i][2] >= max(8, 1.5 * stats[i][3])
+    ]
     widths = [xb - xa for xa, xb, _ in components]
     typical = float(np.median(widths)) if len(widths) >= 2 else 0
     parts = []
     for xa, xb, component in components:
         mask = np.isin(labels, component)
         projection = mask[:, xa:xb].sum(0)
-        if typical and xb - xa > 1.6 * typical:
+        if typical and xb - xa > 1.45 * typical:
             lo = max(1, len(projection) // 4)
             hi = min(len(projection) - 1, 3 * len(projection) // 4)
+            if hi <= lo:
+                parts.append((xa, xb, mask))
+                continue
             cut = lo + int(np.argmin(projection[lo:hi]))
             if projection[cut] <= max(1, 0.15 * projection.max()):
                 left = np.zeros_like(mask)
@@ -252,6 +287,25 @@ def classify(model: Net, glyphs: list[np.ndarray]) -> list[str]:
     return [CLASSES[i] for i in model(values).argmax(1).tolist()]
 
 
+def _decode_with_fallback(
+    model: Net,
+    warp: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    r: int,
+    c: int,
+    chars: list[str],
+) -> dict[str, Any] | None:
+    clue = decode(chars)
+    if clue is not None:
+        return clue
+    for mask in _fallback_inks(warp):
+        clue = decode(classify(model, segment_label(mask, xs, ys, r, c)))
+        if clue is not None:
+            return clue
+    return None
+
+
 def load_model(path: str | os.PathLike[str] = DEFAULT_MODEL) -> Net:
     model = Net().to(DEVICE)
     checkpoint = Path(path)
@@ -270,11 +324,22 @@ def parse_image(path: str | os.PathLike[str], model: Net) -> dict[str, Any]:
     warp, ink = preprocess(image)
     n, xs, ys = find_grid(warp)
     vertical, horizontal = edge_scores(ink, n, xs, ys)
-    cages = []
+    pending: list[tuple[list[list[int]], list[np.ndarray]]] = []
+    all_glyphs: list[np.ndarray] = []
     for cells in cage_cells(n, vertical, horizontal):
         r, c = min(map(tuple, cells))
-        clue = decode(classify(model, segment_label(ink, xs, ys, r, c)))
+        glyphs = segment_label(ink, xs, ys, r, c)
+        pending.append((cells, glyphs))
+        all_glyphs.extend(glyphs)
+    all_chars = classify(model, all_glyphs)
+    cages = []
+    offset = 0
+    for cells, glyphs in pending:
+        chars = all_chars[offset:offset + len(glyphs)]
+        offset += len(glyphs)
+        clue = _decode_with_fallback(model, warp, xs, ys, *min(map(tuple, cells)), chars)
         if clue is None:
+            r, c = min(map(tuple, cells))
             raise ValueError(f"Could not recognize clue at {(r, c)} in {path}.")
         cages.append({**clue, "cells": cells})
     return {"n": n, "filename": Path(path).name, "cages": cages}
@@ -505,13 +570,14 @@ def train_model(root: str | os.PathLike[str], output: str | os.PathLike[str] = D
     model = Net().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), 1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
-    x = torch.tensor(samples).float().div(255).unsqueeze(1).to(DEVICE)
     y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
     counts = np.bincount(labels, minlength=len(CLASSES)).astype(np.float32)
     weights = np.sqrt(counts.sum() / np.maximum(counts, 1))
     weights /= weights.mean()
     class_weights = torch.tensor(weights, dtype=torch.float32, device=DEVICE)
-    operator_indices = {CLASSES.index("+"), CLASSES.index("/")}
+    operator_indices = {
+        CLASSES.index(operator) for operator in "+-*/"
+    }
     for epoch in range(epochs):
         model.train()
         augmented = np.stack([
