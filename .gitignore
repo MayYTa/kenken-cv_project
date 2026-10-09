@@ -35,5 +35,19 @@ build/
 dist/
 *.egg-info/
 
-
+# Local datasets and generated artifacts
 dataset/
+dataset_test/
+irrelevant/
+pred*.json
+*.log
+
+# Local uploaded/test images
+prueba*.jpg
+PRUEBA*.png
+WhatsApp Image *.jpeg
+
+# Deployment/runtime files
+.streamlit/secrets.toml
+.streamlit/cache/
+*.pid
