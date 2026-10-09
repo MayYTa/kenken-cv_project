@@ -100,7 +100,15 @@ def _clusters(profile: np.ndarray, threshold: float) -> list[float]:
 
 
 def find_grid(warp: np.ndarray) -> tuple[int, np.ndarray, np.ndarray]:
-    loose = (warp < 235).astype(np.uint8)
+    # A fixed threshold treats the whole gray background of camera photos as
+    # ink, producing one giant profile instead of the individual grid lines.
+    background_level = float(np.percentile(warp, 50))
+    line_threshold = (
+        235.0
+        if background_level >= 220.0
+        else max(80.0, 0.65 * background_level)
+    )
+    loose = (warp < line_threshold).astype(np.uint8)
     xs = _clusters(loose.sum(0), 0.6 * S)
     ys = _clusters(loose.sum(1), 0.6 * S)
     if len(xs) < 2 or len(ys) < 2:
